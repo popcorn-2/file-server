@@ -80,6 +80,10 @@ impl<'a> Iter<'a> {
 
         self.data = data.split_at(align_point - header.size.as_usize()).1;
 
+        if header.ty != 0 && header.ty != b'0' {
+            return self.next_inner();
+        }
+
         let path = CStr::from_bytes_until_nul(&header.file_name)
             .with_context(|| "failed to parse filename as C string")?;
         let utf8 = String::from_utf8_lossy(path.to_bytes());
