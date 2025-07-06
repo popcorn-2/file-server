@@ -1,7 +1,9 @@
 use crate::vfs::Node;
 use anyhow::bail;
 use std::collections::HashMap;
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
+use std::sync::Arc;
+use crate::vfs::file::File;
 
 #[derive(Debug)]
 pub struct Directory {
@@ -22,6 +24,20 @@ impl Directory {
                 children: HashMap::new(),
             }))
             .as_directory_mut()
+    }
+
+    pub fn get_subdir(&self, path: &OsStr) -> Option<&Directory> {
+        match self.children.get(path) {
+            Some(Node::Directory(dir)) => Some(dir),
+            _ => None,
+        }
+    }
+
+    pub fn get_child(&self, path: &OsStr) -> Option<&Arc<File>> {
+        match self.children.get(path) {
+            Some(Node::File(file)) => Some(file),
+            _ => None,
+        }
     }
 
     pub fn add_child(&mut self, path: OsString, child: Node) -> anyhow::Result<()> {
