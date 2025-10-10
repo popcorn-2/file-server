@@ -1,0 +1,8 @@
+[package]
+name = "executor"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+async-executor = { version = "1.13.2", features = ["static"] }
+slab = "0.4.10"

@@ -4,6 +4,8 @@
 #![feature(bstr)]
 #![feature(slice_ptr_get)]
 
+extern crate alloc;
+
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::ffi::OsStr;
 use std::fs::File;
@@ -11,7 +13,7 @@ use std::mem::ManuallyDrop;
 use std::io::Read as _;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::thread;
+use std::{fs, thread};
 use anyhow::Context;
 use std::os::popcorn::process::CommandExt;
 use std::os::popcorn::handle::{AsRawHandle, FromRawHandle};
@@ -52,14 +54,25 @@ fn main() -> anyhow::Result<()> {
 
     drop(vfs_flag);
 
-    println!("vfs initialised - starting root bus driver...");
+    println!("[initd] starting device manager...");
 
-    let root_driver = format!("fs:/system/bin/driver/{}_root.exec", std::env::consts::ARCH);
-    let exit_code = std::process::Command::new(&root_driver)
-            .stdin(std::process::Stdio::null())
-            .handle(OsStr::from_str("popcorn.init.root-bus-descriptor").to_owned(), std::os::popcorn::process::inherit())
-            .spawn()
-            .with_context(|| format!("failed to spawn `{root_driver}`"))?;
-    
-    loop { thread::yield_now(); }
+	let exit_code = std::process::Command::new("fs:/system/bin/devman.exec")
+			.stdin(std::process::Stdio::null())
+			.handle(OsStr::from_str("popcorn.init.root-bus-descriptor").to_owned(), std::os::popcorn::process::inherit())
+			.spawn()
+			.with_context(|| format!("failed to spawn device manager"))?;
+
+	let programs = fs::read_to_string("fs:/init.txt")
+			.context("failed to read `init.txt`")?;
+	for program in programs.lines() {
+		let program = program.trim();
+		if program.is_empty() { continue; }
+		println!("[initd] starting `{program}`...");
+		let exit_code = std::process::Command::new(program)
+				.stdin(std::process::Stdio::null())
+				.spawn()
+				.with_context(|| format!("failed to spawn `{program}`"))?;
+	}
+
+	Ok(())
 }

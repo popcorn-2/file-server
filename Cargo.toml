@@ -3,8 +3,16 @@ name = "file-server"
 version = "0.1.0"
 edition = "2024"
 
+[workspace]
+members = [ "executor", "server" ]
+
 [dependencies]
 anyhow = "1.0.98"
 slab = "0.4.10"
 slotmap = "1.0.7"
 zerocopy = { version = "0.8.25", features = ["derive", "std"] }
+popcorn-server = { path = "server" }
+executor = { path = "executor" }
+
+[patch.crates-io]
+fastrand = { path = "fastrand" }

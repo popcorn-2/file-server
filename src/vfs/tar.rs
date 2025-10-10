@@ -25,6 +25,7 @@ const _: () = {
     assert!(size_of::<Header>() == 512);
 };
 
+
 impl Debug for Header {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         let checksum = self.checksum;
@@ -75,10 +76,10 @@ impl<'a> Iter<'a> {
         let align_point = if header.size.as_usize() & 511 == 0 {
             0
         } else {
-            (header.size.as_usize() | 511) + 1
+            (header.size.as_usize() | 511) + 1 - header.size.as_usize()
         };
 
-        self.data = data.split_at(align_point - header.size.as_usize()).1;
+        self.data = data.split_at(align_point).1;
 
         if header.ty != 0 && header.ty != b'0' {
             return self.next_inner();

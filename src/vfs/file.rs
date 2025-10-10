@@ -45,6 +45,8 @@ impl FileCache {
     
     pub fn read(&self, mut read_range: Range<usize>, buf: &mut Vec<u8>) {
         println!("read {read_range:?}");
+
+	    if read_range.is_empty() { return; }
         
         let (idx_start, offset_start) = self.pieces.iter().enumerate().find_map(|(idx, (range, _))| {
             if range.contains(&read_range.start) {

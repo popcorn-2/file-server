@@ -7,15 +7,16 @@ use std::mem::{ManuallyDrop, MaybeUninit};
 use std::os::popcorn::handle::{AsHandle, AsRawHandle, BorrowedHandle, OwnedHandle};
 use std::path::Path;
 use std::slice;
-use std::sync::{Arc, Condvar, Mutex, OnceLock};
+use std::sync::{Arc, Condvar, Mutex, OnceLock, RwLock};
 use std::sync::atomic::{AtomicBool, Ordering};
 use anyhow::Context;
 use directory::Directory;
 use file::File;
-use std::os::popcorn::proto::server::{self, ProtocolVisitor, CtorContext, DispatchTable, ServerHandler, ReturnHandle, SyncTr as _};
 use std::os::popcorn::proto::Error;
 use std::os::popcorn::proto::{Protocol, proc::BuilderTr as _};
 use slab::Slab;
+use executor::io::popcorn::AsyncOwnedHandle;
+use popcorn_server::{CtorContext, ProtocolVisitor, ReturnHandle, Server, DispatchTable, ServerHandler, SyncTr as _};
 
 mod directory;
 mod file;
@@ -30,13 +31,13 @@ pub fn vfs_main(started_flag: Arc<AtomicBool>, data_pointer: &[u8]) -> anyhow::R
 	println!("initialised vfs from ramdisk");
 	println!("{vfs:#?}");
 
-	let srv = server::Server::new(":fs", |handle| ServerState::new(vfs, handle))
+	let srv = Server::new(":fs", |handle| ServerState::new(vfs, handle))
 			.context("failed to start fs server")?;
 
 	started_flag.store(true, Ordering::SeqCst);
 	drop(started_flag);
 
-	srv.event_loop()
+	Arc::new(srv).run()
 }
 
 #[derive(Debug)]
@@ -98,8 +99,8 @@ impl Node {
 
 struct ServerState {
 	vfs: Vfs,
-	open_files: RefCell<Slab<HandleState>>,
-	handle: OwnedHandle<server::Sync>,
+	open_files: Mutex<Slab<HandleState>>,
+	handle: AsyncOwnedHandle<popcorn_server::Sync>,
 }
 
 struct HandleState {
@@ -108,17 +109,17 @@ struct HandleState {
 }
 
 impl ServerState {
-	fn new(vfs: Vfs, handle: OwnedHandle<server::Sync>) -> Self {
+	fn new(vfs: Vfs, handle: AsyncOwnedHandle<popcorn_server::Sync>) -> Self {
 		Self {
 			vfs,
-			open_files: RefCell::new(Slab::new()),
+			open_files: Mutex::new(Slab::new()),
 			handle,
 		}
 	}
 
 	fn open_file(&self, path: &Path) -> Result<isize, Error> {
 		let state = self.vfs.get_file(path).ok_or(Error::EndpointNotFound)?;
-		let handle = self.open_files.borrow_mut().insert(HandleState {
+		let handle = self.open_files.lock().unwrap().insert(HandleState {
 			offset: 0,
 			file: Arc::clone(state),
 		});
@@ -130,7 +131,7 @@ impl ServerState {
 impl ServerHandler for ServerState {
 	type CtorContext = CtorCtx;
 
-	fn ctor(&self, endpoint: &Path, ctx: Self::CtorContext) -> Result<ReturnHandle, Error> {
+	async fn ctor(&self, endpoint: &Path, ctx: Self::CtorContext) -> Result<ReturnHandle, Error> {
 		println!("open {} with {ctx:?}", endpoint.display());
 		match ctx {
 			CtorCtx::Unknown => return Err(Error::UnsupportedProtocol),
@@ -141,22 +142,22 @@ impl ServerHandler for ServerState {
 			},
 			CtorCtx::Process => {
 				let file_handle = self.open_file(endpoint)?;
-				let file_handle = self.handle.forge::<(std::os::popcorn::proto::io::Read, std::os::popcorn::proto::io::Seek)>(file_handle)?;
+				let file_handle = self.handle.as_handle().forge::<(std::os::popcorn::proto::io::Read, std::os::popcorn::proto::io::Seek)>(file_handle)?;
 				
 				let program_name = endpoint.file_stem().unwrap_or_else(|| endpoint.as_os_str());
 				let mut elf_path = OsString::from("elf:");
 				elf_path.push(program_name);
-				let handle = OwnedHandle::<std::os::popcorn::proto::proc::Builder>::new_from(elf_path, file_handle)?;
+				let handle = AsyncOwnedHandle::<std::os::popcorn::proto::proc::Builder>::new_from(elf_path, file_handle).await?;
 
 				println!("vfs builder handle: {handle:?}");
 
-				Ok(ReturnHandle::Transfer(handle.type_erase()))
+				Ok(ReturnHandle::Transfer(handle.into_sync().type_erase()))
 			}
 		}
 	}
 
-	fn destroy(&self, handle: isize) -> Result<(), Error> {
-		self.open_files.borrow_mut().remove(handle as usize);
+	async fn destroy(&self, handle: isize) -> Result<(), Error> {
+		self.open_files.lock().unwrap().remove(handle as usize);
 		Ok(())
 	}
 
@@ -168,81 +169,66 @@ impl ServerHandler for ServerState {
 				.add_vtable(<Self as proto::CoreIoWrite>::__vtable())
 				.add_vtable(<Self as proto::CoreIoSeek>::__vtable())
 				.add_vtable(<Self as proto::CoreFsFile>::__vtable())
-				.add_vtable(<Self as proto::CoreProcBuilder>::__vtable())
 		)
 	}
 
-	fn handle(&self) -> BorrowedHandle<'_, server::Sync> { self.handle.as_handle() }
+	fn handle(&self) -> &AsyncOwnedHandle<popcorn_server::Sync> { &self.handle }
 }
 
 impl proto::CoreIoRead for ServerState {
-	fn new_from(&self, endpoint: &Path, handle: OwnedHandle) -> Result<ReturnHandle, Error> {
+	async fn new_from(&self, endpoint: &Path, handle: OwnedHandle) -> Result<ReturnHandle, Error> {
 		Err(Error::UnsupportedProtocol)
 	}
 
-	fn read(&self, handle: isize, output_size: usize) -> Result<Box<[u8]>, Error> {
+	async fn read(&self, handle: isize, output_size: usize) -> Result<Box<[u8]>, Error> {
 		println!("read {output_size} bytes from {handle}");
-		let mut guard = self.open_files.borrow_mut();
+		let mut guard = self.open_files.lock().unwrap();
 		let state = guard.get_mut(handle as usize)
 				.ok_or(Error::InvalidHandle)?;
 		let res = state.file.read(state.offset..(state.offset + output_size));
 		state.offset += res.len();
-		println!("read {} bytes ({})", res.len(), ByteStr::new(&res));
+		println!("read {} bytes", res.len());
 		Ok(res)
 	}
 }
 
 impl proto::CoreIoWrite for ServerState {
-	fn new_from(&self, endpoint: &Path, handle: OwnedHandle) -> Result<ReturnHandle, Error> {
+	async fn new_from(&self, endpoint: &Path, handle: OwnedHandle) -> Result<ReturnHandle, Error> {
 		Err(Error::UnsupportedProtocol)
 	}
 
-	fn write(&self, handle: isize, buf: &[u8]) -> Result<usize, Error> {
-		let buf = std::bstr::ByteStr::new(buf);
+	async fn write(&self, handle: isize, buf: &[u8]) -> Result<usize, Error> {
+		let buf = ByteStr::new(buf);
 		println!("write {buf} to {handle}");
 		Ok(0)
 	}
 }
 
 impl proto::CoreFsFile for ServerState {
-	fn new_from(&self, endpoint: &Path, handle: OwnedHandle) -> Result<ReturnHandle, Error> {
+	async fn new_from(&self, endpoint: &Path, handle: OwnedHandle) -> Result<ReturnHandle, Error> {
 		Err(Error::UnsupportedProtocol)
 	}
 }
 
 impl proto::CoreIoSeek for ServerState {
-	fn new_from(&self, endpoint: &Path, handle: OwnedHandle) -> Result<ReturnHandle, Error> {
+	async fn new_from(&self, endpoint: &Path, handle: OwnedHandle) -> Result<ReturnHandle, Error> {
 		Err(Error::UnsupportedProtocol)
 	}
 
-	fn tell(&self, handle: isize) -> Result<usize, Error> {
-		let mut guard = self.open_files.borrow();
+	async fn tell(&self, handle: isize) -> Result<usize, Error> {
+		let guard = self.open_files.lock().unwrap();
 		let state = guard.get(handle as usize)
 		                 .ok_or(Error::InvalidHandle)?;
 		Ok(state.offset)
 	}
 
-	fn set_pos(&self, handle: isize, pos: usize) -> Result<(), Error> {
-		let mut guard = self.open_files.borrow_mut();
+	async fn set_pos(&self, handle: isize, pos: usize) -> Result<(), Error> {
+		let mut guard = self.open_files.lock().unwrap();
 		let state = guard.get_mut(handle as usize)
 		                 .ok_or(Error::InvalidHandle)?;
 		let pos = min(pos, state.file.meta_size);
 		state.offset = pos;
 		Ok(())
-	}
-}
-
-impl proto::CoreProcBuilder for ServerState {
-	fn spawn(&self, handle: isize) -> Result<ReturnHandle, Error> {
-		Err(Error::UnsupportedProtocol)
-	}
-
-	fn add_handle(&self, handle: isize, name: &str, added_handle: OwnedHandle) -> Result<(), Error> {
-		Err(Error::UnsupportedProtocol)
-	}
-
-	fn new_from(&self, endpoint: &Path, handle: OwnedHandle) -> Result<ReturnHandle, Error> {
-		Err(Error::UnsupportedProtocol)
 	}
 }
 

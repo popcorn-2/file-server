@@ -14,4 +14,7 @@ fn main() {
 	f.push("protocol.gen.rs");
 	println!("cargo:rerun-if-changed={}", f.display());
 	fs::write(f, output.stdout).unwrap();
+
+	println!("cargo:rustc-link-arg=--target=x86_64-unknown-popcorn");
+	println!("cargo:rustc-link-arg=--sysroot=/Users/Eliyahu/popcorn2/_build/sysroot");
 }

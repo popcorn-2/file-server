@@ -1,0 +1,9 @@
+[package]
+name = "popcorn-server"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+
+[dependencies]
+executor = { path = "../executor" }
