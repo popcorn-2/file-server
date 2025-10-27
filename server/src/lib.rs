@@ -337,6 +337,14 @@ impl<T: ServerHandler + 'static> Server<T> {
     pub fn handle(&self) -> &AsyncOwnedHandle<Sync> {
         self.handler.handle()
     }
+
+	pub fn inner(&self) -> &T {
+		&self.handler
+	}
+
+	pub fn inner_mut(&mut self) -> &mut T {
+		&mut self.handler
+	}
 }
 
 pub trait ServerHandler {
@@ -366,6 +374,7 @@ impl<U: ?Sized> ProtocolVisitor<U> {
     }
 }
 
+#[derive(Debug)]
 pub struct DispatchTable {
     map: HashMap<u128, for<'a> fn(&'a (), usize, usize, usize, usize, usize) -> Pin<Box<dyn 'a + Send + Future<Output = core::result::Result<Result, Error>>>>>,
 }
