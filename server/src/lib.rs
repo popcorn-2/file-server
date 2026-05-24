@@ -2,217 +2,27 @@
 #![feature(try_blocks)]
 #![feature(slice_ptr_get)]
 #![feature(macro_metavar_expr_concat)]
+#![feature(macro_metavar_expr)]
 #![feature(asm_goto_with_outputs)]
+#![feature(popcorn_std)]
 
 use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::io;
 use std::mem::ManuallyDrop;
-use std::os::popcorn::handle::{AsRawHandle, OwnedHandle, AsHandle};
-use std::os::popcorn::proto::{Error, Protocol};
+use std::os::popcorn::io::{AsRawHandle, OwnedHandle, AsHandle, FromRawHandle, RawHandle};
+use std::os::popcorn::proto::{protocol, Protocol, ProtocolList};
 use std::path::Path;
-use std::pin::{Pin, pin};
 use std::ptr::{slice_from_raw_parts, with_exposed_provenance};
 use executor::io::popcorn::AsyncOwnedHandle;
-use std::os::popcorn::proto::ProtocolTuple;
-use std::os::popcorn::handle::FromRawHandle;
-use std::os::popcorn::handle::RawHandle;
-use std::mem::MaybeUninit;
 use std::sync::Arc;
-use std::task::{Context, Poll, Waker};
-
-macro_rules! syscall_async {
-    ($uid:expr $(, $arg:expr)* => Ok($res_h:ident) => $happy:block Err($res_e:ident) => $error:block) => {
-        let val = executor::async_syscall!($uid $(, $arg)*).await;
-        match val {
-            Ok($res_h) => $happy,
-            Err($res_e) => $error,
-        }
-    }
-}
-
-macro_rules! syscall_sync {
-    ($uid:expr => Ok($res_h:ident) => $happy:block Err($res_e:ident) => $error:block) => {
-        let low: u64;
-        let high: u64;
-        ::core::arch::asm!(
-            "clc",
-            "syscall",
-            "jc {error}",
-            inout("rax") $uid as u64 => low,
-            out("rcx") _,
-            out("rdx") high,
-            out("rdi") _,
-            out("rsi") _,
-            out("r8") _,
-            inout("r9") (($uid as u128) >> 64) as u64 => _,
-            out("r10") _,
-            out("r11") _,
-            out("r12") _,
-            error = label { match ::std::io::Error::from_raw_os_error(low as isize) { $res_e => $error } }
-        );
-        match (high as u128) << 64 | (low as u128) { $res_h => $happy }
-    };
-    ($uid:expr, $arg0:expr => Ok($res_h:ident) => $happy:block Err($res_e:ident) => $error:block) => {
-        let low: u64;
-        let high: u64;
-        ::core::arch::asm!(
-            "clc",
-            "syscall",
-            "jc {error}",
-            inout("rax") $uid as u64 => low,
-            out("rcx") _,
-            out("rdx") high,
-            out("rsi") _,
-            inout("rdi") $arg0 as usize => _,
-            out("r8") _,
-            inout("r9") (($uid as u128) >> 64) as u64 => _,
-            out("r10") _,
-            out("r11") _,
-            out("r12") _,
-            error = label { match ::std::io::Error::from_raw_os_error(low as isize) { $res_e => $error } }
-        );
-        match (high as u128) << 64 | (low as u128) { $res_h => $happy }
-    };
-    ($uid:expr, $arg0:expr, $arg1:expr => Ok($res_h:ident) => $happy:block Err($res_e:ident) => $error:block) => {
-        let low: u64;
-        let high: u64;
-        ::core::arch::asm!(
-            "clc",
-            "syscall",
-            "jc {error}",
-            inout("rax") $uid as u64 => low,
-            out("rcx") _,
-            out("rdx") high,
-            inout("rdi") $arg0 as usize => _,
-            inout("rsi") $arg1 as usize => _,
-            out("r8") _,
-            inout("r9") (($uid as u128) >> 64) as u64 => _,
-            out("r10") _,
-            out("r11") _,
-            out("r12") _,
-            error = label { match ::std::io::Error::from_raw_os_error(low as isize) { $res_e => $error } }
-        );
-        match (high as u128) << 64 | (low as u128) { $res_h => $happy }
-    };
-    ($uid:expr, $arg0:expr, $arg1:expr, $arg2:expr => Ok($res_h:ident) => $happy:block Err($res_e:ident) => $error:block) => {
-        let low: u64;
-        let high: u64;
-        ::core::arch::asm!(
-            "clc",
-            "syscall",
-            "jc {error}",
-            inout("rax") $uid as u64 => low,
-            out("rcx") _,
-            inout("rdx") $arg2 as usize => high,
-            inout("rdi") $arg0 as usize => _,
-            inout("rsi") $arg1 as usize => _,
-            out("r8") _,
-            inout("r9") (($uid as u128) >> 64) as u64 => _,
-            out("r10") _,
-            out("r11") _,
-            out("r12") _,
-            error = label { match ::std::io::Error::from_raw_os_error(low as isize) { $res_e => $error } }
-        );
-        match (high as u128) << 64 | (low as u128) { $res_h => $happy }
-    };
-    ($uid:expr, $arg0:expr, $arg1:expr, $arg2:expr, $arg3: expr => Ok($res_h:ident) => $happy:block Err($res_e:ident) => $error:block) => {
-        let low: u64;
-        let high: u64;
-        ::core::arch::asm!(
-            "clc",
-            "syscall",
-            "jc {error}",
-            inout("rax") $uid as u64 => low,
-            out("rcx") _,
-            inout("rdx") $arg2 as usize => high,
-            inout("rdi") $arg0 as usize => _,
-            inout("rsi") $arg1 as usize => _,
-            out("r8") _,
-            inout("r9") (($uid as u128) >> 64) as u64 => _,
-            inout("r10") $arg3 as usize => _,
-            out("r11") _,
-            out("r12") _,
-            error = label { match ::std::io::Error::from_raw_os_error(low as isize) { $res_e => $error } }
-        );
-        match (high as u128) << 64 | (low as u128) { $res_h => $happy }
-    };
-    ($uid:expr, $arg0:expr, $arg1:expr, $arg2:expr, $arg3:expr, $arg4:expr => Ok($res_h:ident) => $happy:block Err($res_e:ident) => $error:block) => {
-        let low: u64;
-        let high: u64;
-        ::core::arch::asm!(
-            "clc",
-            "syscall",
-            "jc {error}",
-            inout("rax") $uid as u64 => low,
-            out("rcx") _,
-            inout("rdx") $arg2 as usize => high,
-            inout("rdi") $arg0 as usize => _,
-            inout("rsi") $arg1 as usize => _,
-            inout("r8") $arg4 as usize => _,
-            inout("r9") (($uid as u128) >> 64) as u64 => _,
-            inout("r10") $arg3 as usize => _,
-            out("r11") _,
-            out("r12") _,
-            error = label { match ::std::io::Error::from_raw_os_error(low as isize) { $res_e => $error } }
-        );
-        match (high as u128) << 64 | (low as u128) { $res_h => $happy }
-    };
-}
-
-macro_rules! protocol {
-    () => {};
-    (pub protocol $name:ident = $uid:literal {
-        ctor => {
-            $($ctor_arg:ident : $ctor_ty:ty),* $(,)?
-        }
-
-        $(fn ~$fn_name_d:ident($this_d:ident $(, $fn_arg_d:ident: $fn_ty_d:ty)* $(,)?) $(-> $fn_ret_d:ty)? $f_d:block)*
-        $(fn $fn_name:ident $(<$($gen_ident:ident $(: $gen_bound:path)?),* $(,)?>)? (&$this:ident $(, $fn_arg:ident: $fn_ty:ty)* $(,)?) $(-> $fn_ret:ty)? $f:block)*
-    } $($rest:tt)*) => {
-        #[repr(C)]
-        pub struct $name {
-            $(pub $ctor_arg : $ctor_ty),*
-        }
-
-        impl std::os::popcorn::proto::Protocol for $name {
-            type Ctor = Self;
-            const UID: u128 = $uid;
-        }
-
-        pub trait ${concat($name, Tr)} {
-            $(fn $fn_name_d($this_d $(, $fn_arg_d: $fn_ty_d)*) $(-> std::io::Result<$fn_ret_d>)? where Self: Sized;)*
-            $(fn $fn_name $(<$($gen_ident $(: $gen_bound)?),*>)? (&$this $(, $fn_arg: $fn_ty)*) $(-> std::io::Result<$fn_ret>)? where Self: Sized;)*
-        }
-
-        pub trait ${concat(Async, $name, Tr)} {
-            $(async fn $fn_name_d($this_d $(, $fn_arg_d: $fn_ty_d)*) $(-> std::io::Result<$fn_ret_d>)? where Self: Sized;)*
-            $(async fn $fn_name $(<$($gen_ident $(: $gen_bound)?),*>)? (&$this $(, $fn_arg: $fn_ty)*) $(-> std::io::Result<$fn_ret>)? where Self: Sized;)*
-        }
-
-        impl<T: std::os::popcorn::proto::HasProtocol<$name>> ${concat($name, Tr)} for std::os::popcorn::handle::OwnedHandle<T> {
-            $(fn $fn_name_d($this_d $(, $fn_arg_d: $fn_ty_d)*) $(-> std::io::Result<$fn_ret_d>)? where Self: Sized { use syscall_sync as syscall; #[allow(dead_code)] const UID: u128 = $uid; $f_d })*
-            $(fn $fn_name $(<$($gen_ident $(: $gen_bound)?),*>)? (&$this $(, $fn_arg: $fn_ty)*) $(-> std::io::Result<$fn_ret>)? where Self: Sized { use syscall_sync as syscall; #[allow(dead_code)] const UID: u128 = $uid; $f })*
-        }
-        impl<T: std::os::popcorn::proto::HasProtocol<$name>> ${concat($name, Tr)} for std::os::popcorn::handle::BorrowedHandle<'_, T> {
-            $(fn $fn_name_d($this_d $(, $fn_arg_d: $fn_ty_d)*) $(-> std::io::Result<$fn_ret_d>)? where Self: Sized { use syscall_sync as syscall; #[allow(dead_code)] const UID: u128 = $uid; $f_d })*
-            $(fn $fn_name $(<$($gen_ident $(: $gen_bound)?),*>)? (&$this $(, $fn_arg: $fn_ty)*) $(-> std::io::Result<$fn_ret>)? where Self: Sized { use syscall_sync as syscall; #[allow(dead_code)] const UID: u128 = $uid; $f })*
-        }
-        impl<T: std::os::popcorn::proto::HasProtocol<$name>> ${concat(Async, $name, Tr)} for executor::io::popcorn::AsyncOwnedHandle<T> {
-            $(async fn $fn_name_d($this_d $(, $fn_arg_d: $fn_ty_d)*) $(-> std::io::Result<$fn_ret_d>)? where Self: Sized { use syscall_async as syscall; #[allow(dead_code)] const UID: u128 = $uid; $f_d })*
-            $(async fn $fn_name $(<$($gen_ident $(: $gen_bound)?),*>)? (&$this $(, $fn_arg: $fn_ty)*) $(-> std::io::Result<$fn_ret>)? where Self: Sized { use syscall_async as syscall; #[allow(dead_code)] const UID: u128 = $uid; $f })*
-        }
-
-        protocol!($($rest)*);
-    };
-}
 
 protocol! {
-	pub protocol Sync = 8 {
-		ctor => {}
-
-		fn next(&self) -> Packet {
-			let mut buf = MaybeUninit::<Packet>::uninit();
+	pub unsafe protocol (Sync, AsyncSync) = 8 {
+		fn next@1(&self) -> std::io::Result<Packet> {
+            args => [{todo!(); 1usize}];
+            _ => todo!();
+			/*let mut buf = MaybeUninit::<Packet>::uninit();
 
 			unsafe {
 				syscall!(1u128<<96 | UID, self.as_raw_handle().0, buf.as_mut_ptr() =>
@@ -223,33 +33,22 @@ protocol! {
 						return Err(e);
 					}
 				);
-			}
+			}*/
 		}
 
-		fn reply(&self, response: Response) -> () {
-			unsafe {
-				syscall!(2u128<<96 | UID, self.as_raw_handle().0, &response as *const Response =>
-					Ok(_res) => {
-						return Ok(())
-					}
-					Err(e) => {
-						return Err(e);
-					}
-				);
-			}
+		fn reply@2(&self, response: Response) -> std::io::Result<()> {
+            args => [&response as *const Response as usize];
+            _ => ();
 		}
 
-		fn forge<U: ProtocolTuple>(&self, handle: isize) -> OwnedHandle<U> {
-			unsafe {
-				syscall!(3u128<<96 | UID, self.as_raw_handle().0, handle, U::UID.as_ptr(), U::UID.len() * size_of::<u128>() =>
-					Ok(res) => {
-						return Ok(unsafe { OwnedHandle::from_raw_handle(RawHandle(res as isize)) });
-					}
-					Err(e) => {
-						return Err(e);
-					}
-				);
-			}
+		fn forge@3<U: ProtocolList>(&self, handle_id: isize) -> std::io::Result<OwnedHandle<U>> {
+            args => [
+                handle_id as usize,
+                U::UIDs.as_ptr() as usize,
+                U::UIDs.len() * size_of::<u128>()
+            ];
+			
+            ret => unsafe { OwnedHandle::from_raw_handle(RawHandle(ret as isize)) };
 		}
 	}
 }
@@ -259,19 +58,20 @@ pub struct Server<T: ServerHandler> {
 }
 
 impl<T: ServerHandler + 'static> Server<T> {
-    pub fn new(name: impl AsRef<OsStr>, handler: impl FnOnce(AsyncOwnedHandle<Sync>) -> T) -> io::Result<Self> {
-        let handle = OwnedHandle::<Sync>::new(name, Sync {})?;
+    pub fn new(name: impl AsRef<OsStr>, handler: impl FnOnce(AsyncOwnedHandle<&dyn AsyncSync>) -> T) -> io::Result<Self> {
+        /*let handle = OwnedHandle::<&dyn Sync>::new(name)?;
         let handle = AsyncOwnedHandle::from_sync(handle);
         Ok(Self {
             handler: handler(handle),
-        })
+        })*/
+        todo!()
     }
 
     pub async fn next_packet(&self) -> io::Result<Packet> {
-        AsyncSyncTr::next(self.handler.handle()).await
+        AsyncSync::next(self.handle()).await
     }
 
-    async fn process(&self, packet: Packet) {
+    pub async fn process(&self, packet: Packet) {
         println!("received packet: {packet:#x?}");
 
         let result: core::result::Result<Result, Error> = if packet.uid == 1u128 << 96 {
@@ -289,8 +89,13 @@ impl<T: ServerHandler + 'static> Server<T> {
                 for &uid in uids {
                     //let deserialize = table.ctor_deserialize(uid)?;
                     let ctor = Box::<[u8]>::from([]); // fixme //deserialize(&mut args)?;
-                    let f = ctx.visitors().table.get(&uid).ok_or(Error::UnsupportedProtocol)?;
-                    f(&mut ctx, ctor.as_ptr())?;
+	                if let Some(f) = ctx.visitors().table.get(&uid) {
+		                f(&mut ctx, ctor.as_ptr())?;
+	                } else if let Some(f) = ctx.visitors().default {
+		                f(&mut ctx, uid)?;
+	                } else {
+		                Err(Error::UnsupportedProtocol)?;
+	                }
                 }
                 Result::from(self.handler.ctor(Path::new(endpoint), ctx).await?)
             }
@@ -310,7 +115,7 @@ impl<T: ServerHandler + 'static> Server<T> {
         let result_clone = result.as_ref().map(Result::clone_private).map_err(|e| *e);
         let error = result.is_err();
 
-        SyncTr::reply(&self.handler.handle().as_handle(), Response {
+        Sync::reply(&self.handler.handle().as_handle(), Response {
             result: result.unwrap_or_else(|e| Result::Value(e as u128)),
             packet: packet.packet,
             error,
@@ -334,7 +139,7 @@ impl<T: ServerHandler + 'static> Server<T> {
         })
     }
 
-    pub fn handle(&self) -> &AsyncOwnedHandle<Sync> {
+    pub fn handle(&self) -> &AsyncOwnedHandle<&'static dyn AsyncSync> {
         self.handler.handle()
     }
 
@@ -354,7 +159,7 @@ pub trait ServerHandler {
     async fn destroy(&self, handle: isize) -> core::result::Result<(), Error>;
     fn dispatch_table(&self) -> &'static DispatchTable;
 
-    fn handle(&self) -> &AsyncOwnedHandle<Sync>;
+    fn handle(&self) -> &AsyncOwnedHandle<&'static dyn AsyncSync>;
 }
 
 pub trait CtorContext where Self: 'static + Default {
@@ -363,15 +168,26 @@ pub trait CtorContext where Self: 'static + Default {
 
 pub struct ProtocolVisitor<U: ?Sized> {
     table: HashMap<u128, fn(&mut U, *const u8) -> core::result::Result<(), Error>>,
+	default: Option<fn(&mut U, u128) -> core::result::Result<(), Error>>,
 }
 
 impl<U: ?Sized> ProtocolVisitor<U> {
-    pub fn new() -> Self { Self { table: HashMap::new() } }
+    pub fn new() -> Self {
+	    Self {
+		    table: HashMap::new(),
+		    default: None,
+	    }
+    }
 
     pub fn add_visitor<T: Protocol + ?Sized>(mut self, f: fn(&mut U, &T::Ctor) -> core::result::Result<(), Error>) -> Self {
         self.table.insert(T::UID, unsafe { core::mem::transmute(f) });
         self
     }
+
+	pub fn add_default(mut self, f: fn(&mut U, u128) -> core::result::Result<(), Error>) -> Self {
+		self.default = Some(f);
+		self
+	}
 }
 
 #[derive(Debug)]

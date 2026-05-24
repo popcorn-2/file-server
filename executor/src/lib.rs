@@ -1,4 +1,5 @@
 #![feature(popcorn_protocol)]
+#![feature(popcorn_std)]
 #![feature(asm_goto_with_outputs)]
 
 use std::task::{Context, Poll, Waker};
@@ -7,10 +8,6 @@ use std::future::Future;
 use std::pin::pin;
 
 pub mod io;
-
-pub mod __macro_private {
-	pub use crate::io::popcorn::{SYSCALL_RESULTS, SyscallState, Syscall};
-}
 
 thread_local! {
 	static RT: LocalExecutor = const { LocalExecutor::new() };
