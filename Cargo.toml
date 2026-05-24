@@ -15,4 +15,4 @@ popcorn-server = { path = "server" }
 executor = { path = "executor" }
 
 [patch.crates-io]
-fastrand = { path = "fastrand" }
+fastrand = { git = "https://github.com/popcorn-2/fastrand.git" }
